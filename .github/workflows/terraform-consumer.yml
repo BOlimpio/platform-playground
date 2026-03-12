@@ -1,0 +1,340 @@
+# =============================================================================
+# Terraform CI/CD Pipeline (Consumer Workflow) - Unified Approach
+# =============================================================================
+# This workflow consumes reusable workflows from platform-workflows repository.
+#
+# Architecture: Single main branch with environment folders
+# Environments: dev/, staging/, production/
+#
+# Workflow Approach: UNIFIED
+# - Single workflow for all operations (plan, apply, destroy)
+# - Environment selector: dev, staging, production
+# - Action selector: plan, apply, destroy
+# - GitHub Environments provide approval gates:
+#   - dev: Auto-approve
+#   - staging: 1 approval required
+#   - production: 2+ approvals required
+#
+# Test Modes:
+# - environment (default): Tests the selected environment
+# - modules: Tests individual modules with dynamic discovery
+#
+# Reusable Workflows:
+# - platform-workflows: terraform-ci.yml - CI pipeline
+# - platform-workflows: terraform-deploy.yml - Deploy pipeline (plan/apply)
+# - platform-workflows: terraform-destroy.yml - Destroy pipeline
+#
+# Authentication: Uses OIDC to assume AWS role (no long-lived credentials)
+# =============================================================================
+
+name: Terraform CI/CD
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'environments/**'
+      - 'modules/**'
+      - '.github/workflows/terraform-consumer.yml'
+      - '.tflint.hcl'
+      - '.checkov.yaml'
+      - 'compliance/**'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'environments/**'
+      - 'modules/**'
+      - '.github/workflows/terraform-consumer.yml'
+      - '.tflint.hcl'
+      - '.checkov.yaml'
+      - 'compliance/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: '🌍 Target Environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - 'dev'
+          - 'staging'
+          - 'production'
+      action:
+        description: '⚡ Action to perform'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+          - 'plan'
+          - 'apply'
+          - 'destroy'
+      confirm_destroy:
+        description: '⚠️ Type "DESTROY" to confirm destruction (required for destroy action)'
+        required: false
+        default: ''
+        type: string
+      test_mode:
+        description: 'Test mode: environment (unified) or modules (individual)'
+        required: true
+        default: 'environment'
+        type: choice
+        options:
+          - 'environment'
+          - 'modules'
+      modules_to_test:
+        description: 'Modules to test (comma-separated: s3,eks,rds or "all"). Only used when test_mode=modules'
+        required: false
+        default: 'all'
+        type: string
+      run_apply_tests:
+        description: 'Run apply tests (creates real AWS resources)'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+# Cancel in-progress runs for the same branch/environment
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.inputs.environment || 'dev' }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+  security-events: write
+
+# Environment mapping for working directories
+env:
+  WORKING_DIR: environments/${{ github.event.inputs.environment || 'dev' }}
+  TARGET_ENV: ${{ github.event.inputs.environment || 'dev' }}
+  ACTION: ${{ github.event.inputs.action || 'plan' }}
+
+jobs:
+  # ===========================================================================
+  # Validation Job - Check inputs and permissions
+  # ===========================================================================
+  validate:
+    name: 🔐 Validate Inputs
+    runs-on: ubuntu-latest
+    outputs:
+      working_directory: ${{ steps.set-vars.outputs.working_directory }}
+      environment: ${{ steps.set-vars.outputs.environment }}
+      action: ${{ steps.set-vars.outputs.action }}
+      should_run_ci: ${{ steps.set-vars.outputs.should_run_ci }}
+      should_deploy: ${{ steps.set-vars.outputs.should_deploy }}
+      should_destroy: ${{ steps.set-vars.outputs.should_destroy }}
+    steps:
+      - name: Set Variables
+        id: set-vars
+        run: |
+          # Determine environment and action
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            ENV="${{ github.event.inputs.environment }}"
+            ACTION="${{ github.event.inputs.action }}"
+          else
+            # For push/PR, default to dev with plan
+            ENV="dev"
+            ACTION="plan"
+          fi
+          
+          WORKING_DIR="environments/${ENV}"
+          
+          echo "working_directory=${WORKING_DIR}" >> $GITHUB_OUTPUT
+          echo "environment=${ENV}" >> $GITHUB_OUTPUT
+          echo "action=${ACTION}" >> $GITHUB_OUTPUT
+          
+          # Determine which jobs should run
+          if [ "${ACTION}" == "destroy" ]; then
+            echo "should_run_ci=false" >> $GITHUB_OUTPUT
+            echo "should_deploy=false" >> $GITHUB_OUTPUT
+            echo "should_destroy=true" >> $GITHUB_OUTPUT
+          elif [ "${ACTION}" == "apply" ]; then
+            echo "should_run_ci=true" >> $GITHUB_OUTPUT
+            echo "should_deploy=true" >> $GITHUB_OUTPUT
+            echo "should_destroy=false" >> $GITHUB_OUTPUT
+          else
+            # plan
+            echo "should_run_ci=true" >> $GITHUB_OUTPUT
+            echo "should_deploy=false" >> $GITHUB_OUTPUT
+            echo "should_destroy=false" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "## 🎯 Workflow Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🌍 Environment | **${ENV}** |" >> $GITHUB_STEP_SUMMARY
+          echo "| ⚡ Action | **${ACTION}** |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📁 Working Directory | ${WORKING_DIR} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔄 Event | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Validate Destroy Confirmation
+        if: github.event.inputs.action == 'destroy'
+        run: |
+          CONFIRM="${{ github.event.inputs.confirm_destroy }}"
+          if [ "${CONFIRM}" != "DESTROY" ]; then
+            echo "❌ ERROR: Destroy action requires typing 'DESTROY' in the confirmation field"
+            echo ""
+            echo "To destroy resources, you must:"
+            echo "1. Select 'destroy' as the action"
+            echo "2. Type 'DESTROY' (all caps) in the confirmation field"
+            exit 1
+          fi
+          echo "✅ Destroy confirmation validated"
+
+      - name: Production Safety Check
+        if: github.event.inputs.environment == 'production' && github.event.inputs.action == 'destroy'
+        run: |
+          echo "⚠️ WARNING: You are about to DESTROY PRODUCTION resources!"
+          echo ""
+          echo "This action will:"
+          echo "- Delete all managed infrastructure in production"
+          echo "- Remove EKS clusters, RDS databases, S3 buckets"
+          echo "- This action is IRREVERSIBLE for stateful resources"
+          echo ""
+          echo "Proceeding with destroy (approval gates will still apply)..."
+
+  # ===========================================================================
+  # CI Pipeline - Reusable Workflow (for plan/apply actions)
+  # ===========================================================================
+  ci:
+    name: 🔍 CI Pipeline
+    needs: validate
+    if: needs.validate.outputs.should_run_ci == 'true'
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+      security-events: write
+    uses: BOlimpio/platform-workflows/.github/workflows/terraform-ci.yml@v1
+    with:
+      working_directory: ${{ needs.validate.outputs.working_directory }}
+      environment: ${{ needs.validate.outputs.environment }}
+      terraform_version: "1.10.0"
+      tflint_version: "v0.50.0"
+      aws_region: "us-east-1"
+      modules_base_path: "modules/aws"
+      test_directory: "tests"
+      plan_test_file: "plan.tftest.hcl"
+      apply_test_file: "apply.tftest.hcl"
+      test_mode: ${{ github.event.inputs.test_mode || 'environment' }}
+      modules_to_test: ${{ github.event.inputs.modules_to_test || 'all' }}
+      run_apply_tests: ${{ github.event.inputs.run_apply_tests == 'true' }}
+      enable_security_scan: true
+      enable_compliance: true
+      enable_cost_estimation: true
+      enable_lint: true
+      lint_child_modules: true
+      exclude_modules_pattern: "issue-*"
+      compliance_features_path: "compliance/features"
+      compliance_tfvars_file: "tests/compliance.tfvars"
+      checkov_config_file: ".checkov.yaml"
+      tflint_config_file: ".tflint.hcl"
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+      INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+
+  # ===========================================================================
+  # Deploy Pipeline - Reusable Workflow (for apply action)
+  # ===========================================================================
+  deploy:
+    name: 🚀 Deploy to ${{ needs.validate.outputs.environment }}
+    needs: [validate, ci]
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      needs.validate.outputs.should_deploy == 'true' && 
+      needs.ci.result == 'success'
+    permissions:
+      id-token: write
+      contents: read
+    uses: BOlimpio/platform-workflows/.github/workflows/terraform-deploy.yml@v1
+    with:
+      working_directory: ${{ needs.validate.outputs.working_directory }}
+      environment: ${{ needs.validate.outputs.environment }}
+      terraform_version: "1.10.0"
+      aws_region: "us-east-1"
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+
+  # ===========================================================================
+  # Destroy Pipeline - Reusable Workflow (for destroy action)
+  # ===========================================================================
+  destroy:
+    name: 💥 Destroy ${{ needs.validate.outputs.environment }}
+    needs: validate
+    if: |
+      github.event_name == 'workflow_dispatch' && 
+      needs.validate.outputs.should_destroy == 'true'
+    permissions:
+      id-token: write
+      contents: read
+    uses: BOlimpio/platform-workflows/.github/workflows/terraform-destroy.yml@v1
+    with:
+      working_directory: ${{ needs.validate.outputs.working_directory }}
+      environment: ${{ needs.validate.outputs.environment }}
+      terraform_version: "1.10.0"
+      aws_region: "us-east-1"
+      confirmation_word: ${{ github.event.inputs.confirm_destroy }}
+      expected_confirmation: "DESTROY"
+    secrets:
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+
+  # ===========================================================================
+  # Summary Job
+  # ===========================================================================
+  summary:
+    name: 📊 Pipeline Report
+    runs-on: ubuntu-latest
+    needs: [validate, ci, deploy, destroy]
+    if: always()
+    steps:
+      - name: Generate Report
+        run: |
+          echo "## 🎯 Terraform Pipeline Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Pipeline Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🌍 Environment | **${{ needs.validate.outputs.environment }}** |" >> $GITHUB_STEP_SUMMARY
+          echo "| ⚡ Action | **${{ needs.validate.outputs.action }}** |" >> $GITHUB_STEP_SUMMARY
+          echo "| 📁 Working Directory | ${{ needs.validate.outputs.working_directory }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🧪 Test Mode | ${{ github.event.inputs.test_mode || 'environment' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔄 Event | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🌿 Ref | ${{ github.ref }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Job Results" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔐 Validate | ${{ needs.validate.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🔍 CI Pipeline | ${{ needs.ci.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🚀 Deploy | ${{ needs.deploy.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 💥 Destroy | ${{ needs.destroy.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Add promotion guidance
+          if [ "${{ needs.validate.outputs.action }}" == "apply" ] && [ "${{ needs.deploy.result }}" == "success" ]; then
+            ENV="${{ needs.validate.outputs.environment }}"
+            if [ "${ENV}" == "dev" ]; then
+              echo "### 🚀 Next Steps: Promote to Staging" >> $GITHUB_STEP_SUMMARY
+              echo "Your changes have been applied to **dev**. To promote to staging:" >> $GITHUB_STEP_SUMMARY
+              echo "1. Go to Actions → Terraform CI/CD → Run workflow" >> $GITHUB_STEP_SUMMARY
+              echo "2. Select Environment: **staging**" >> $GITHUB_STEP_SUMMARY
+              echo "3. Select Action: **apply**" >> $GITHUB_STEP_SUMMARY
+              echo "4. Wait for approval (1 reviewer required)" >> $GITHUB_STEP_SUMMARY
+            elif [ "${ENV}" == "staging" ]; then
+              echo "### 🚀 Next Steps: Promote to Production" >> $GITHUB_STEP_SUMMARY
+              echo "Your changes have been applied to **staging**. To promote to production:" >> $GITHUB_STEP_SUMMARY
+              echo "1. Go to Actions → Terraform CI/CD → Run workflow" >> $GITHUB_STEP_SUMMARY
+              echo "2. Select Environment: **production**" >> $GITHUB_STEP_SUMMARY
+              echo "3. Select Action: **apply**" >> $GITHUB_STEP_SUMMARY
+              echo "4. Wait for approval (2+ reviewers required)" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "### ✅ Production Deployment Complete" >> $GITHUB_STEP_SUMMARY
+              echo "Your changes have been successfully deployed to **production**!" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi

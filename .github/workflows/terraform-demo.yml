@@ -1,0 +1,364 @@
+# =============================================================================
+# Terraform CI/CD Pipeline - DEMO MODE
+# =============================================================================
+# This workflow demonstrates the full CI/CD pipeline with all validation,
+# testing, security scanning, and compliance checks.
+#
+# ✅ Added:
+# - OIDC AWS authentication for terraform test
+#
+# NOTE:
+# - terraform test filter expects the RELATIVE PATH (including tests/), e.g.:
+#   terraform test -filter=tests/plan.tftest.hcl
+# =============================================================================
+
+name: Terraform CI (Demo)
+
+on:
+  workflow_dispatch:
+    inputs:
+      module_type:
+        description: 'Module type to scan'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - 'all'
+          - 's3'
+          - 'lambda'
+          - 'sqs'
+      test_filter:
+        description: 'Optional: run a specific test file (ex: plan.tftest.hcl). Leave empty to run all tests.'
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  group: demo-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TERRAFORM_VERSION: "1.10.0"
+  TFLINT_VERSION: "v0.50.0"
+  AWS_REGION: "us-east-1"
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  # ===========================================================================
+  # Setup - Determine which modules to scan
+  # ===========================================================================
+  setup:
+    name: 🔧 Setup
+    runs-on: ubuntu-latest
+    outputs:
+      modules: ${{ steps.set-modules.outputs.modules }}
+      examples: ${{ steps.set-modules.outputs.examples }}
+    steps:
+      - name: Determine modules to scan
+        id: set-modules
+        run: |
+          MODULE_TYPE="${{ github.event.inputs.module_type || 'all' }}"
+          
+          if [[ "$MODULE_TYPE" == "all" ]]; then
+            MODULES='["modules/aws/s3", "modules/aws/lambda", "modules/aws/sqs"]'
+            EXAMPLES='["examples/s3", "examples/lambda", "examples/sqs"]'
+          else
+            MODULES='["modules/aws/'$MODULE_TYPE'"]'
+            EXAMPLES='["examples/'$MODULE_TYPE'"]'
+          fi
+          
+          echo "modules=$MODULES" >> $GITHUB_OUTPUT
+          echo "examples=$EXAMPLES" >> $GITHUB_OUTPUT
+          
+          echo "## Demo Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Module Type**: $MODULE_TYPE" >> $GITHUB_STEP_SUMMARY
+          echo "- **Modules**: $MODULES" >> $GITHUB_STEP_SUMMARY
+          echo "- **Test Filter**: ${{ github.event.inputs.test_filter || '(all tests)' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **Expected Result**: Pipeline will validate, test (with OIDC), and scan secure modules" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # Stage 1: Format Check
+  # ===========================================================================
+  format:
+    name: 🎨 Format Check
+    runs-on: ubuntu-latest
+    needs: setup
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Check formatting
+        run: terraform fmt -check -recursive -diff
+
+  # ===========================================================================
+  # Stage 2: Validate
+  # ===========================================================================
+  validate:
+    name: ✅ Validate
+    runs-on: ubuntu-latest
+    needs: [setup, format]
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJson(needs.setup.outputs.modules) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Init
+        working-directory: ${{ matrix.module }}
+        run: terraform init -backend=false
+
+      - name: Terraform Validate
+        working-directory: ${{ matrix.module }}
+        run: terraform validate
+
+  # ===========================================================================
+  # Stage 3: Lint (TFLint)
+  # ===========================================================================
+  lint:
+    name: 🔍 Lint
+    runs-on: ubuntu-latest
+    needs: [setup, validate]
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJson(needs.setup.outputs.modules) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+
+      - name: Initialize TFLint
+        run: tflint --init
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Run TFLint
+        working-directory: ${{ matrix.module }}
+        run: |
+          echo "## TFLint Results for ${{ matrix.module }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          tflint --config=${{ github.workspace }}/.tflint.hcl --format=compact 2>&1 | tee -a $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+          # Actually run and fail if issues
+          tflint --config=${{ github.workspace }}/.tflint.hcl --format=compact
+
+  # ===========================================================================
+  # Stage 3.5: Terraform Tests (terraform test) + OIDC
+  # ===========================================================================
+  tests:
+    name: 🧪 Terraform Tests
+    runs-on: ubuntu-latest
+    needs: [setup, validate]
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJson(needs.setup.outputs.modules) }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Build role session name
+        id: session
+        shell: bash
+        run: |
+          MOD="${{ matrix.module }}"
+          SAFE_MOD="${MOD//\//-}"           # replace / with -
+          SAFE_MOD="${SAFE_MOD//[^A-Za-z0-9+=,.@_-]/-}"  # extra safety
+          echo "name=terraform-demo-tests-${{ github.run_id }}-${SAFE_MOD}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: ${{ steps.session.outputs.name }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init (no backend)
+        working-directory: ${{ matrix.module }}
+        run: terraform init -backend=false
+
+      - name: Run Terraform Tests
+        working-directory: ${{ matrix.module }}
+        shell: bash
+        env:
+          AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+        run: |
+          echo "## Terraform Tests for ${{ matrix.module }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Test filter input: '${{ github.event.inputs.test_filter }}'" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "Listing test files:"
+          find tests -maxdepth 3 -name "*.tftest.hcl" -print || true
+          
+          FILTER="${{ github.event.inputs.test_filter }}"
+          if [[ -n "$FILTER" ]]; then
+            # -filter expects the relative test file path (including tests/)
+            TESTFILE="tests/${FILTER}"
+            test -f "$TESTFILE" || (echo "Missing $TESTFILE" && exit 1)
+            terraform test -filter="$TESTFILE"
+          else
+            terraform test
+          fi
+
+  # ===========================================================================
+  # Stage 4: Security Scan (Checkov)
+  # ===========================================================================
+  security:
+    name: 🔐 Security Scan
+    runs-on: ubuntu-latest
+    needs: [setup, lint, tests]
+    strategy:
+      fail-fast: false
+      matrix:
+        module: ${{ fromJson(needs.setup.outputs.modules) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ matrix.module }}
+          output_format: cli
+          soft_fail: false
+          framework: terraform
+
+  # ===========================================================================
+  # Stage 5: Compliance (terraform-compliance)
+  # ===========================================================================
+  compliance:
+    name: 📋 Compliance
+    runs-on: ubuntu-latest
+    needs: [setup, security]
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        example: ${{ fromJson(needs.setup.outputs.examples) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          # IMPORTANT: cache requires requirements.txt or pyproject.toml, so keep it off for this repo
+          # cache: 'pip'
+
+      - name: Install terraform-compliance
+        run: pip install terraform-compliance
+
+      - name: Build role session name
+        id: session
+        run: |
+          EX="${{ matrix.example }}"
+          SAFE_EX="${EX//\//-}"
+          SAFE_EX="${SAFE_EX//[^A-Za-z0-9+=,.@_-]/-}"
+          echo "name=terraform-demo-compliance-${{ github.run_id }}-${SAFE_EX}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: ${{ steps.session.outputs.name }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Terraform Init
+        working-directory: ${{ matrix.example }}
+        run: terraform init -backend=false
+
+      - name: Generate Terraform Plan
+        working-directory: ${{ matrix.example }}
+        env:
+          AWS_DEFAULT_REGION: ${{ env.AWS_REGION }}
+        run: |
+          terraform plan -out=tfplan -input=false
+          terraform show -json tfplan > tfplan.json
+
+      - name: Run terraform-compliance
+        working-directory: ${{ matrix.example }}
+        run: |
+          echo "## Compliance Results for ${{ matrix.example }}" >> $GITHUB_STEP_SUMMARY
+          terraform-compliance \
+            -f ${{ github.workspace }}/compliance/features \
+            -p tfplan.json 2>&1 | tee -a $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # Summary Job
+  # ===========================================================================
+  summary:
+    name: 📊 Summary
+    runs-on: ubuntu-latest
+    needs: [setup, format, validate, lint, tests, security, compliance]
+    if: always()
+    steps:
+      - name: Check job results
+        run: |
+          echo "## Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Format | ${{ needs.format.result == 'success' && '✅' || '❌' }} ${{ needs.format.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Validate | ${{ needs.validate.result == 'success' && '✅' || '❌' }} ${{ needs.validate.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Lint | ${{ needs.lint.result == 'success' && '✅' || '❌' }} ${{ needs.lint.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tests | ${{ needs.tests.result == 'success' && '✅' || '❌' }} ${{ needs.tests.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security | ${{ needs.security.result == 'success' && '✅' || '❌' }} ${{ needs.security.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Compliance | ${{ needs.compliance.result == 'success' && '✅' || '❌' }} ${{ needs.compliance.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ needs.format.result }}" == "success" ]] && \
+             [[ "${{ needs.validate.result }}" == "success" ]] && \
+             [[ "${{ needs.lint.result }}" == "success" ]] && \
+             [[ "${{ needs.tests.result }}" == "success" ]] && \
+             [[ "${{ needs.security.result }}" == "success" ]] && \
+             [[ "${{ needs.compliance.result }}" == "success" ]]; then
+            echo "✅ **All checks passed!** The modules follow best practices." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Some checks failed.** Review the results above." >> $GITHUB_STEP_SUMMARY
+          fi
