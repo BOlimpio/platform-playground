@@ -1,0 +1,48 @@
+# =============================================================================
+# TERRAFORM VARIABLES - Development Environment
+# =============================================================================
+# Copy this file to terraform.tfvars and customize for your environment.
+# Do NOT commit terraform.tfvars with sensitive values to version control.
+# =============================================================================
+
+# General Settings
+aws_region   = "us-east-1"
+environment  = "dev"
+project_name = "terraform-ci-playground"
+
+# VPC & Networking
+vpc_cidr           = "10.0.0.0/16"
+availability_zones = ["us-east-1a", "us-east-1b"]
+enable_nat_gateway = true
+
+# S3 Buckets
+cors_allowed_origins = ["https://*.example.com"]
+
+# EKS Cluster
+enable_eks              = true
+eks_cluster_version     = "1.29"
+eks_public_access       = true
+eks_public_access_cidrs = ["0.0.0.0/0"]  # Restrict in production!
+
+eks_node_groups = {
+  general = {
+    instance_types = ["t3.medium"]
+    desired_size   = 2
+    min_size       = 1
+    max_size       = 5
+    disk_size      = 50
+    capacity_type  = "ON_DEMAND"
+    labels = {
+      role = "general"
+    }
+  }
+}
+
+# RDS PostgreSQL
+enable_rds                = true
+rds_engine_version        = "18.2"
+rds_instance_class        = "db.t3.micro"
+rds_allocated_storage     = 20
+rds_max_allocated_storage = 100
+rds_database_name         = "myapp"
+rds_username              = "admin"

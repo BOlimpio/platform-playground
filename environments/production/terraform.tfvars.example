@@ -1,0 +1,50 @@
+# =============================================================================
+# TERRAFORM VARIABLES - Production Environment
+# =============================================================================
+# Copy this file to terraform.tfvars and customize for your environment.
+# Do NOT commit terraform.tfvars with sensitive values to version control.
+#
+# ⚠️ PRODUCTION ENVIRONMENT - Review all settings carefully!
+# =============================================================================
+
+# General Settings
+aws_region   = "us-east-1"
+environment  = "prod"
+project_name = "terraform-ci-playground"
+
+# VPC & Networking (Different CIDR from dev/staging)
+vpc_cidr           = "10.2.0.0/16"
+availability_zones = ["us-east-1a", "us-east-1b", "us-east-1c"]  # 3 AZs for HA
+enable_nat_gateway = true
+
+# S3 Buckets
+cors_allowed_origins = ["https://example.com", "https://www.example.com"]
+
+# EKS Cluster - Production settings
+enable_eks              = true
+eks_cluster_version     = "1.29"
+eks_public_access       = false  # ⚠️ Disabled for security!
+eks_public_access_cidrs = []     # Empty = no public access
+
+eks_node_groups = {
+  general = {
+    instance_types = ["t3.large"]
+    desired_size   = 3           # Minimum 3 for HA
+    min_size       = 3
+    max_size       = 10
+    disk_size      = 100
+    capacity_type  = "ON_DEMAND"  # Always ON_DEMAND for production
+    labels = {
+      role = "general"
+    }
+  }
+}
+
+# RDS PostgreSQL - Production settings
+enable_rds                = true
+rds_engine_version        = "18.2"
+rds_instance_class        = "db.r6g.large"  # Production-grade
+rds_allocated_storage     = 100
+rds_max_allocated_storage = 1000
+rds_database_name         = "myapp"
+rds_username              = "admin"

@@ -1,0 +1,57 @@
+# Terraform directories
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+tfplan.json
+
+# Crash log files
+crash.log
+crash.*.log
+
+# Exclude sensitive variable files
+*.tfvars
+!terraform.tfvars.example
+*.auto.tfvars
+
+# Exclude override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# CLI configuration
+.terraformrc
+terraform.rc
+
+# Lock file
+**/.terraform.lock.hcl
+
+# IDE
+.idea/
+*.swp
+*.swo
+.vscode/
+*.code-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test outputs
+checkov-results.json
+results.sarif
+coverage/
+
+# Node modules (if using any JS tools)
+node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Infracost
+.infracost/
