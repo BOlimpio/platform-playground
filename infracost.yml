@@ -1,0 +1,16 @@
+# Infracost Configuration
+version: 0.1
+
+projects:
+  - path: examples/modules/s3
+    name: s3-example
+    terraform_var_files:
+      - terraform.tfvars
+
+  - path: examples/modules/eks
+    name: eks-example
+    skip_autodetect: true  # EKS requires VPC inputs
+
+  - path: examples/modules/rds
+    name: rds-example
+    skip_autodetect: true  # RDS requires VPC inputs

@@ -1,0 +1,125 @@
+# =============================================================================
+# Checkov Configuration
+# =============================================================================
+
+framework:
+  - terraform
+
+directory:
+  - modules
+  - environments
+  - bootstrap
+
+skip-path:
+  - .terraform
+  - .git
+  - node_modules
+  - __pycache__
+
+# Output format
+output:
+  - cli
+  - json
+
+# Output file for JSON results
+output-file-path: checkov-results.json
+
+# Compact output (less verbose)
+compact: true
+
+# Show only failed checks
+quiet: false
+
+# -----------------------------------------------------------------------------
+# Check Skipping
+# -----------------------------------------------------------------------------
+# Skip checks that don't apply to this repository or are handled elsewhere.
+# Always document why a check is skipped!
+
+skip-check:
+
+  # ---------------------------
+  # S3 - Advanced Enterprise Requirements
+  # ---------------------------
+  - CKV_AWS_144    # Cross-region replication (not required for playground)
+  - CKV2_AWS_62    # S3 event notifications (not required)
+  - CKV_AWS_145    # Enforce CMK instead of AES256 (optional for dev)
+  - CKV_AWS_300    # Abort incomplete multipart upload lifecycle
+  - CKV2_AWS_61    # Lifecycle configuration required for all buckets
+
+  # ---------------------------
+  # Networking - Public Infra Intentional
+  # ---------------------------
+  - CKV_AWS_130    # Public subnets assign public IP (intentional)
+  - CKV2_AWS_12    # Default security group restrictions (managed externally)
+  - CKV2_AWS_11    # VPC Flow Logs not enabled (cost control)
+  - CKV2_AWS_19    # EIP allocation without attachment (valid during creation)
+  - CKV2_AWS_5     # Security group attached to resource: checked at VPC boundary, not SG level
+
+  # ---------------------------
+  # Lambda - Playground Scope
+  # ---------------------------
+  # CKV_AWS_117: VPC placement adds NAT Gateway cost + complexity not warranted for a
+  # playground Lambda demo. Network isolation is achieved at the VPC/SG level for other
+  # resources; Lambda is invoked only internally.
+  - CKV_AWS_117    # Lambda inside VPC: intentionally omitted for cost/simplicity
+
+  # CKV_AWS_272: Code-signing requires an AWS Signer signing profile + code-signing config
+  # resource, which is disproportionate for a playground inline-handler demo function.
+  - CKV_AWS_272    # Lambda code-signing: not required for playground inline handler
+
+  # CKV_AWS_173: KMS encryption for Lambda env vars requires a CMK. This playground uses
+  # SQS-managed SSE (no KMS) to keep IAM policy surface minimal and avoid KMS costs.
+  - CKV_AWS_173    # Lambda env var KMS encryption: using SQS-managed SSE instead
+
+  # ---------------------------
+  # CloudWatch - Log Group Controls
+  # ---------------------------
+  - CKV_AWS_158    # CloudWatch log group KMS encryption: using default SSE to avoid KMS costs
+  - CKV_AWS_338    # Log retention < 1 year: playground logs use shorter retention to save costs
+
+  # ---------------------------
+  # IAM - AWS API Limitations
+  # ---------------------------
+  # EC2 Describe/List operations (DescribeAvailabilityZones, DescribeInstances, etc.)
+  # do NOT support resource-level permissions in AWS — resources must be "*".
+  # Scope is restricted via aws:RequestedRegion condition instead.
+  # Reference: https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonec2.html
+  - CKV_AWS_356    # IAM wildcard resource: required for EC2/RDS describe and S3 ListAllMyBuckets
+
+  # ---------------------------
+  # IAM - S3 Wildcard Actions
+  # ---------------------------
+  # The S3BucketAccess statement uses s3:* to avoid chasing individual Terraform provider
+  # API calls (GetBucketWebsite, GetAccelerateConfiguration, etc.) on every refresh.
+  # Security is maintained by scoping resources to specific bucket ARN prefixes (tcip-* and
+  # ${resource_prefix}*), not to resources = ["*"].
+  - CKV_AWS_355    # IAM wildcard action: s3:* is scoped to named bucket prefixes, not "*"
+
+# -----------------------------------------------------------------------------
+# Severity Levels
+# -----------------------------------------------------------------------------
+# Only fail on specific severity levels
+# Possible values: critical, high, medium, low
+
+check:
+  # Run all checks
+  - CKV_AWS_*
+  - CKV2_AWS_*
+
+# Soft fail - show issues but don't fail the build
+# Set to false in production/strict mode
+soft-fail: false
+
+# -----------------------------------------------------------------------------
+# External Checks (Optional)
+# -----------------------------------------------------------------------------
+# You can add custom checks here
+# external-checks-dir:
+#   - custom_checks/
+
+# -----------------------------------------------------------------------------
+# Baseline (Optional)
+# -----------------------------------------------------------------------------
+# Use a baseline to track new vs existing issues
+# baseline: .checkov.baseline
