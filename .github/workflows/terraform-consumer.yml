@@ -109,9 +109,10 @@ permissions:
   security-events: write
 
 # Environment mapping for working directories
+# For push/PR events, WORKING_DIR and TARGET_ENV are auto-detected from changed files at runtime
 env:
-  WORKING_DIR: environments/${{ github.event.inputs.environment || 'dev' }}
-  TARGET_ENV: ${{ github.event.inputs.environment || 'dev' }}
+  WORKING_DIR: environments/${{ github.event.inputs.environment || 'auto-detected' }}
+  TARGET_ENV: ${{ github.event.inputs.environment || 'auto-detected' }}
   ACTION: ${{ github.event.inputs.action || 'plan' }}
 
 jobs:
@@ -122,6 +123,7 @@ jobs:
     name: 🔐 Validate Inputs
     runs-on: ubuntu-latest
     outputs:
+      environments: ${{ steps.set-vars.outputs.environments }}
       working_directory: ${{ steps.set-vars.outputs.working_directory }}
       environment: ${{ steps.set-vars.outputs.environment }}
       action: ${{ steps.set-vars.outputs.action }}
@@ -129,11 +131,22 @@ jobs:
       should_deploy: ${{ steps.set-vars.outputs.should_deploy }}
       should_destroy: ${{ steps.set-vars.outputs.should_destroy }}
     steps:
-      - name: Checkout (for changed file detection)
+      - name: Checkout
         if: github.event_name != 'workflow_dispatch'
         uses: actions/checkout@v4
+
+      - name: Detect changed environments
+        if: github.event_name != 'workflow_dispatch'
+        id: env-filter
+        uses: dorny/paths-filter@v3
         with:
-          fetch-depth: 0
+          filters: |
+            production:
+              - 'environments/production/**'
+            staging:
+              - 'environments/staging/**'
+            dev:
+              - 'environments/dev/**'
 
       - name: Set Variables
         id: set-vars
@@ -142,36 +155,32 @@ jobs:
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             ENV="${{ github.event.inputs.environment }}"
             ACTION="${{ github.event.inputs.action }}"
+            ENVS_JSON="[\"${ENV}\"]"
           else
-            # For push/PR, detect environment from changed file paths
-            if [ "${{ github.event_name }}" == "pull_request" ]; then
-              CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD 2>/dev/null || echo "")
-            else
-              BEFORE="${{ github.event.before }}"
-              if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
-                CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "")
-              else
-                CHANGED_FILES=$(git diff --name-only ${BEFORE} ${{ github.sha }} 2>/dev/null || echo "")
-              fi
+            # For push/PR, build list of changed environments from dorny/paths-filter outputs
+            ENVS=()
+            if [ "${{ steps.env-filter.outputs.production }}" == "true" ]; then
+              ENVS+=("production")
             fi
-
-            # Extract unique environment names from environments/<env>/ paths
-            CHANGED_ENVS=$(echo "$CHANGED_FILES" | grep '^environments/' | cut -d'/' -f2 | sort -u)
-
-            # Priority: production > staging > dev
-            if echo "$CHANGED_ENVS" | grep -q "^production$"; then
-              ENV="production"
-            elif echo "$CHANGED_ENVS" | grep -q "^staging$"; then
-              ENV="staging"
-            else
-              ENV="dev"
+            if [ "${{ steps.env-filter.outputs.staging }}" == "true" ]; then
+              ENVS+=("staging")
             fi
-
+            if [ "${{ steps.env-filter.outputs.dev }}" == "true" ]; then
+              ENVS+=("dev")
+            fi
+            # Fallback to dev when only non-environment paths changed (e.g. modules/)
+            if [ ${#ENVS[@]} -eq 0 ]; then
+              ENVS=("dev")
+            fi
+            ENVS_JSON=$(printf '"%s",' "${ENVS[@]}" | sed 's/,$//')
+            ENVS_JSON="[${ENVS_JSON}]"
+            ENV="${ENVS[0]}"
             ACTION="plan"
           fi
           
           WORKING_DIR="environments/${ENV}"
-          
+
+          echo "environments=${ENVS_JSON}" >> $GITHUB_OUTPUT
           echo "working_directory=${WORKING_DIR}" >> $GITHUB_OUTPUT
           echo "environment=${ENV}" >> $GITHUB_OUTPUT
           echo "action=${ACTION}" >> $GITHUB_OUTPUT
@@ -231,9 +240,13 @@ jobs:
   # CI Pipeline - Reusable Workflow (for plan/apply actions)
   # ===========================================================================
   ci:
-    name: 🔍 CI Pipeline
+    name: 🔍 CI Pipeline (${{ matrix.environment }})
     needs: validate
     if: needs.validate.outputs.should_run_ci == 'true'
+    strategy:
+      matrix:
+        environment: ${{ fromJson(needs.validate.outputs.environments) }}
+      fail-fast: false
     permissions:
       id-token: write
       contents: read
@@ -241,8 +254,8 @@ jobs:
       security-events: write
     uses: BOlimpio/platform-workflows/.github/workflows/terraform-ci.yml@v1
     with:
-      working_directory: ${{ needs.validate.outputs.working_directory }}
-      environment: ${{ needs.validate.outputs.environment }}
+      working_directory: environments/${{ matrix.environment }}
+      environment: ${{ matrix.environment }}
       terraform_version: "1.10.0"
       tflint_version: "v0.50.0"
       aws_region: "us-east-1"
